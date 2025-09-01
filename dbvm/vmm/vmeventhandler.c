@@ -3121,391 +3121,358 @@ int handleInterruptProtectedMode(pcpuinfo currentcpuinfo, VMRegisters *vmregiste
 
   if (intinfo.interruptvector == 1)
   {
-    // Check if the instruction at RIP is ICEBP (0xF1)
+    // Detect ICEBP (F1). For traps, RIP already points to the *next* instruction.
     UINT64 rip = vmread(vm_guest_rip);
     UINT64 cs_base = vmread(vm_guest_cs_base);
-    UINT64 linear_addr = cs_base + rip;
 
-    unsigned char instruction = 0;
-    unsigned char *instr_page = mapVMmemory(currentcpuinfo, linear_addr, 1, NULL, NULL);
     int is_icebp = 0;
-
-    if (instr_page != NULL)
+    if (rip)
     {
-      instruction = *instr_page;
-      unmapVMmemory(instr_page, 1);
-      is_icebp = (instruction == 0xF1);
+      UINT64 probe = cs_base + (rip - 1); // look at the byte before RIP
+      unsigned char *p = mapVMmemory(currentcpuinfo, probe, 1, NULL, NULL);
+      if (p)
+      {
+        is_icebp = (*p == 0xF1);
+        unmapVMmemory(p, 1);
+      }
     }
+
     if (is_icebp)
     {
-      // This is ICEBP - pass through to guest unchanged
+      // ICEBP: #DB trap. RIP already advanced; do NOT advance again.
       sendstring("ICEBP detected - passing through to guest\n");
+      // Do not modify DR6 for ICEBP; leave as-is.
+      isFault = 0; // trap
+    }
+    else
+    {
+      // Not ICEBP — handle as normal debug exception (hw bp / single-step etc.)
+      regDR7 dr7;
+      dr7.DR7 = vmread(vm_guest_dr7);
 
-      // Advance RIP past the ICEBP (trap behavior - instruction completed)
-      vmwrite(vm_guest_rip, rip + 1);
+      // Keep prior behavior (or compute proper fault/trap if you prefer)
+      isFault = 0; // was: isDebugFault(vmread(vm_exit_qualification), dr7.DR7);
 
-      // Don't modify DR6 or do breakpoint handling
-      // Let the normal interrupt injection code at the bottom handle this
-      isFault = 0; // ICEBP is a trap
+      int orig = nosendchar[getAPICID()];
+      nosendchar[getAPICID()] = 0;
+      sendstring("Interrupt 1:\n");
+
+      regDR6 dr6;
+      dr6.DR6 = getDR6();
+
+      regDR6 dr6_exit_qualification;
+      dr6_exit_qualification.DR6 = vmread(vm_exit_qualification);
+
+      // Clear B0..B3; propagate BS/BD from exit qualification
+      dr6.DR6 &= ~0xF;
+      dr6.DR6 |= (dr6_exit_qualification.DR6 & 0x600F);
+      dr6.RTM = ~dr6_exit_qualification.RTM; // preserve your original logic
+      setDR6(dr6.DR6);
+
+      if (currentcpuinfo->Ultimap.Active)
+        ultimap_handleDB(currentcpuinfo);
+      else
+        vmwrite(vm_guest_IA32_DEBUGCTL, vmread(vm_guest_IA32_DEBUGCTL) & ~1); // disable LBR
+
+      // Clear GD
+      dr7.GD = 0;
+      vmwrite(vm_guest_dr7, dr7.DR7);
+      nosendchar[getAPICID()] = orig;
+
+      // Redirection
+      if (int1redirection_idtbypass == 0)
+      {
+        sendstring("Normal\n\r");
+        intinfo.interruptvector = int1redirection;
+        currentcpuinfo->int1happened = (int1redirection != 1);
+      }
+      else
+      {
+        int r;
+        nosendchar[getAPICID()] = 1;
+        r = emulateExceptionInterrupt(currentcpuinfo, vmregisters,
+                                      int1redirection_idtbypass_cs, int1redirection_idtbypass_rip,
+                                      intinfo.haserrorcode, vmread(vm_exit_interruptionerror), isFault);
+        nosendchar[getAPICID()] = orig;
+
+        if (r == 0)
+          return 0;
+        // else: failure to handle, fall through
+      }
     }
   }
-  else
+  else if (intinfo.interruptvector == 3)
   {
-    // Not ICEBP - this is from your breakpoint, use existing logic
-    // emulate the breakpoint interrupt
-    regDR7 dr7;
-    dr7.DR7 = vmread(vm_guest_dr7);
 
-    isFault = 0; // isDebugFault(vmread(vm_exit_qualification), dr7.DR7);
-    int orig = nosendchar[getAPICID()];
-
-    setDR6(dr6.DR6);
-
+    // software bp
     nosendchar[getAPICID()] = 0;
-    sendstring("Interrupt 1:\n");
+    sendstring("Int3 bp\n");
 
-    dr6.DR6 = getDR6();
+    sendvmstate(currentcpuinfo, vmregisters);
 
-    regDR6 dr6_exit_qualification;
-    dr6_exit_qualification.DR6 = vmread(vm_exit_qualification);
-    // The documentation says about the exit qualification: Any of these bits may be set even if its corresponding enabling bit in DR7 is not set.
-    // The documentation also says for dr6: They may or may not be set if the breakpoint is not enabled by the Ln or the Gn flags in register DR7.
-    // therefore, just passing them 1 on 1
-
-    // also: Certain debug exceptions may clear bits 0-3. The remaining contents of the DR6 register are never cleared by the processor.
-    dr6.DR6 &= ~(0xf); // zero the b0 to b3 flags
-
-    /*
-      RFLAGS rflags;
-    rflags.value = vmread(vm_guest_rflags);
-    if(rflags.TF)
+    isFault = 0;
+    if (int3redirection_idtbypass == 0)
     {
-    sendstring("TF is 1");
-    dr6.DR6 |= dr6_exit_qualification.DR6 & 0x600f; //the 4 b0-b3 flags, BS and BD
-    }
-    else
-    {
-    sendstring("TF is 0");
-    dr6.DR6 |= dr6_exit_qualification.DR6 & 0x200f; //the 4 b0-b3 flags, BD
-    }
-    */
-
-    dr6.DR6 |= dr6_exit_qualification.DR6 & 0x600f; // the 4 b0-b3 flags, BS and BD
-    dr6.RTM = ~dr6_exit_qualification.RTM;
-    // if ((dr6_exit_qualification.RTM)==0) dr6.RTM=1; //if this is 0, set RTM to 1
-
-    setDR6(dr6.DR6);
-
-    if (currentcpuinfo->Ultimap.Active)
-      ultimap_handleDB(currentcpuinfo);
-    else
-      vmwrite(vm_guest_IA32_DEBUGCTL, vmread(vm_guest_IA32_DEBUGCTL) & ~1); // disable the LBR bit ( if it isn't already disabled)
-
-    // set GD to 0
-    dr7.GD = 0;
-    vmwrite(vm_guest_dr7, dr7.DR7);
-    nosendchar[getAPICID()] = orig;
-
-    // interrupt redirection for int 1
-    if (int1redirection_idtbypass == 0)
-    {
-      // simple int1 redirection, or not even a different int
+      // simple int3 redirection, or not even a different int
       sendstring("Normal\n\r");
-      intinfo.interruptvector = int1redirection;
-      currentcpuinfo->int1happened = (int1redirection != 1); // only set if redirection to something else than 1
+      intinfo.interruptvector = int3redirection;
+      currentcpuinfo->int3happened = (int3redirection != 3); // only set if redirection to something else than 3
+    }
+    else
+    {
+      nosendchar[getAPICID()] = 0;
+      sendstring("int 3\n");
+
+      vmwrite(vm_guest_rip, vmread(vm_guest_rip) + vmread(vm_exit_instructionlength)); // adjust this automatically (probably 1)
+
+      int r = emulateExceptionInterrupt(currentcpuinfo, vmregisters,
+                                        int3redirection_idtbypass_cs, int3redirection_idtbypass_rip,
+                                        intinfo.haserrorcode, vmread(vm_exit_interruptionerror), 0);
+
+      if (r == 0)
+        return 0;
+    }
+  }
+  else if (intinfo.interruptvector == 14)
+  {
+    // check if the IgnorePageFaults feature is enabled and if it's a non instruction fetch bp
+    if ((currentcpuinfo->IgnorePageFaults.Active) && (vmread(vm_exit_interruptionerror) <= 0xf)) // NO instructiob fetch
+    {
+      currentcpuinfo->IgnorePageFaults.LastIgnoredPageFault = vmread(vm_exit_qualification);
+      vmwrite(vm_guest_rip, vmread(vm_guest_rip) + vmread(vm_exit_instructionlength)); // set eip to the next instruction
+      return 0;
+    }
+
+    setCR2(vmread(vm_exit_qualification));
+
+    if (int14redirection_idtbypass == 0)
+    {
+      // simple int14 redirection, or not even a different int
+      sendstring("Normal\n\r");
+      intinfo.interruptvector = int14redirection;
+      currentcpuinfo->int14happened = (int14redirection != 14); // only set if redirection to something else than 14
     }
     else
     {
       int r;
-      // emulate the interrupt completly, bypassing the idt vector and use what's given in
-      // int14redirection_idtbypass_cs and int14redirection_idtbypass_rip
 
-      nosendchar[getAPICID()] = 1; // I believe this works
-      r = emulateExceptionInterrupt(currentcpuinfo, vmregisters,
-                                    int1redirection_idtbypass_cs, int1redirection_idtbypass_rip,
-                                    intinfo.haserrorcode, vmread(vm_exit_interruptionerror), isFault);
+      if (intinfo.haserrorcode == 0)
+      {
+        nosendchar[getAPICID()] = 0;
+        sendstring("int 14 without errorcode\n");
+      }
 
-      nosendchar[getAPICID()] = orig;
+      if (idtvectorinfo.valid)
+      {
+        nosendchar[getAPICID()] = 0;
+        sendstring("int 14 from an IDT\n");
+      }
 
-      if (r == 0)
-        return 0;
+      if (idtvectorinfo.type != 0)
+      {
+        nosendchar[getAPICID()] = 0;
+        sendstringf("int 14 type is %d instead of 3\n", idtvectorinfo.type);
+      }
 
-      // else failure to handle it
+      sendstring("Interrupt 14:");
+
+      r = 1;
+      if (intinfo.haserrorcode)
+      {
+        int errorcode = vmread(vm_exit_interruptionerror);
+        if ((errorcode & 0x15) == 0x15)
+        {
+          // if it happens because of the NX bit
+          nosendchar[getAPICID()] = 0;
+
+          sendstringf("Errorcode=%x\n", vmread(vm_exit_interruptionerror));
+          sendstringf("CR2=%x\n", vmread(vm_exit_qualification));
+
+          r = emulateExceptionInterrupt(currentcpuinfo, vmregisters,
+                                        int14redirection_idtbypass_cs, int14redirection_idtbypass_rip,
+                                        intinfo.haserrorcode, errorcode, 1);
+        }
+      }
+
+      if (r == 0) // it got handled?
+      {
+        sendstring("r==0, returning\n");
+        return 0; // yes
+      }
+
+      intinfo.interruptvector = int14redirection;
+      currentcpuinfo->int14happened = (int14redirection != 14);
     }
   }
-}
-else if (intinfo.interruptvector == 3)
-{
 
-  // software bp
-  nosendchar[getAPICID()] = 0;
-  sendstring("Int3 bp\n");
+  // do some double fault checking.
+  sendstringf("idtvectorinfo.valid=%d\n\r", idtvectorinfo.valid);
+  sendstringf("idtvectorinfo.type=%d\n\r", idtvectorinfo.type);
+  sendstringf("idtvectorinfo.interruptvector=%d\n\r", idtvectorinfo.interruptvector);
 
-  sendvmstate(currentcpuinfo, vmregisters);
+  sendstringf("intinfo.valid=%d\n\r", intinfo.valid);
+  sendstringf("intinfo.type=%d\n\r", intinfo.type);
+  sendstringf("intinfo.interruptvector=%d\n\r", intinfo.interruptvector);
 
-  isFault = 0;
-  if (int3redirection_idtbypass == 0)
-  {
-    // simple int3 redirection, or not even a different int
-    sendstring("Normal\n\r");
-    intinfo.interruptvector = int3redirection;
-    currentcpuinfo->int3happened = (int3redirection != 3); // only set if redirection to something else than 3
-  }
-  else
+  if (idtvectorinfo.valid)
   {
     nosendchar[getAPICID()] = 0;
-    sendstring("int 3\n");
+    sendstring("idtvectorinfo is VALID\n");
+    sendstringf("idtvectorinfo.type=%d\n", idtvectorinfo.type);
+    // this interrupt is the result of a previous interrupt
 
-    vmwrite(vm_guest_rip, vmread(vm_guest_rip) + vmread(vm_exit_instructionlength)); // adjust this automatically (probably 1)
-
-    int r = emulateExceptionInterrupt(currentcpuinfo, vmregisters,
-                                      int3redirection_idtbypass_cs, int3redirection_idtbypass_rip,
-                                      intinfo.haserrorcode, vmread(vm_exit_interruptionerror), 0);
-
-    if (r == 0)
-      return 0;
-  }
-}
-else if (intinfo.interruptvector == 14)
-{
-  // check if the IgnorePageFaults feature is enabled and if it's a non instruction fetch bp
-  if ((currentcpuinfo->IgnorePageFaults.Active) && (vmread(vm_exit_interruptionerror) <= 0xf)) // NO instructiob fetch
-  {
-    currentcpuinfo->IgnorePageFaults.LastIgnoredPageFault = vmread(vm_exit_qualification);
-    vmwrite(vm_guest_rip, vmread(vm_guest_rip) + vmread(vm_exit_instructionlength)); // set eip to the next instruction
-    return 0;
-  }
-
-  setCR2(vmread(vm_exit_qualification));
-
-  if (int14redirection_idtbypass == 0)
-  {
-    // simple int14 redirection, or not even a different int
-    sendstring("Normal\n\r");
-    intinfo.interruptvector = int14redirection;
-    currentcpuinfo->int14happened = (int14redirection != 14); // only set if redirection to something else than 14
-  }
-  else
-  {
-    int r;
-
-    if (intinfo.haserrorcode == 0)
+    if (idtvectorinfo.type == 3)
     {
-      nosendchar[getAPICID()] = 0;
-      sendstring("int 14 without errorcode\n");
-    }
-
-    if (idtvectorinfo.valid)
-    {
-      nosendchar[getAPICID()] = 0;
-      sendstring("int 14 from an IDT\n");
-    }
-
-    if (idtvectorinfo.type != 0)
-    {
-      nosendchar[getAPICID()] = 0;
-      sendstringf("int 14 type is %d instead of 3\n", idtvectorinfo.type);
-    }
-
-    sendstring("Interrupt 14:");
-
-    r = 1;
-    if (intinfo.haserrorcode)
-    {
-      int errorcode = vmread(vm_exit_interruptionerror);
-      if ((errorcode & 0x15) == 0x15)
+      sendstring("idtvectorinfo.type==3\n");
+      if (idtvectorinfo.interruptvector == 8)
       {
-        // if it happens because of the NX bit
         nosendchar[getAPICID()] = 0;
+        sendstring("TRIPPLEFAULT TRIPPLEFAULT!!! OMGWTF?\n");
+        sendvmstate(currentcpuinfo, vmregisters);
+        displayPreviousStates();
+        ShowCurrentInstructions(currentcpuinfo);
 
-        sendstringf("Errorcode=%x\n", vmread(vm_exit_interruptionerror));
-        sendstringf("CR2=%x\n", vmread(vm_exit_qualification));
-
-        r = emulateExceptionInterrupt(currentcpuinfo, vmregisters,
-                                      int14redirection_idtbypass_cs, int14redirection_idtbypass_rip,
-                                      intinfo.haserrorcode, errorcode, 1);
+        while (1)
+        {
+          outportb(0x80, 0xd6);
+          ddDrawRectangle(0, DDVerticalResolution - 100, 100, 100, _rdtsc() & 0xffffff);
+        }
       }
-    }
 
-    if (r == 0) // it got handled?
-    {
-      sendstring("r==0, returning\n");
-      return 0; // yes
-    }
-
-    intinfo.interruptvector = int14redirection;
-    currentcpuinfo->int14happened = (int14redirection != 14);
-  }
-}
-
-// do some double fault checking.
-sendstringf("idtvectorinfo.valid=%d\n\r", idtvectorinfo.valid);
-sendstringf("idtvectorinfo.type=%d\n\r", idtvectorinfo.type);
-sendstringf("idtvectorinfo.interruptvector=%d\n\r", idtvectorinfo.interruptvector);
-
-sendstringf("intinfo.valid=%d\n\r", intinfo.valid);
-sendstringf("intinfo.type=%d\n\r", intinfo.type);
-sendstringf("intinfo.interruptvector=%d\n\r", intinfo.interruptvector);
-
-if (idtvectorinfo.valid)
-{
-  nosendchar[getAPICID()] = 0;
-  sendstring("idtvectorinfo is VALID\n");
-  sendstringf("idtvectorinfo.type=%d\n", idtvectorinfo.type);
-  // this interrupt is the result of a previous interrupt
-
-  if (idtvectorinfo.type == 3)
-  {
-    sendstring("idtvectorinfo.type==3\n");
-    if (idtvectorinfo.interruptvector == 8)
-    {
-      nosendchar[getAPICID()] = 0;
-      sendstring("TRIPPLEFAULT TRIPPLEFAULT!!! OMGWTF?\n");
-      sendvmstate(currentcpuinfo, vmregisters);
-      displayPreviousStates();
-      ShowCurrentInstructions(currentcpuinfo);
-
-      while (1)
+      doublefault = 1;
+      // now try to disprove that it is a doublefault
+      if (isBenignInterrupt(idtvectorinfo.interruptvector))
       {
-        outportb(0x80, 0xd6);
-        ddDrawRectangle(0, DDVerticalResolution - 100, 100, 100, _rdtsc() & 0xffffff);
-      }
-    }
-
-    doublefault = 1;
-    // now try to disprove that it is a doublefault
-    if (isBenignInterrupt(idtvectorinfo.interruptvector))
-    {
-      sendstring("idtvector is benign\n");
-      doublefault = 0;
-    }
-    else if (isBenignInterrupt(intinfo.interruptvector))
-    {
-      sendstring("intvector is benign");
-      doublefault = 0;
-    }
-
-    if (intinfo.interruptvector == 14)
-    {
-      sendstring("intvector is 14");
-      if (isContributoryInterrupt(idtvectorinfo.interruptvector))
-      {
-        sendstring("idtvector is contributory\n");
+        sendstring("idtvector is benign\n");
         doublefault = 0;
       }
-    }
+      else if (isBenignInterrupt(intinfo.interruptvector))
+      {
+        sendstring("intvector is benign");
+        doublefault = 0;
+      }
 
-    if (doublefault)
+      if (intinfo.interruptvector == 14)
+      {
+        sendstring("intvector is 14");
+        if (isContributoryInterrupt(idtvectorinfo.interruptvector))
+        {
+          sendstring("idtvector is contributory\n");
+          doublefault = 0;
+        }
+      }
+
+      if (doublefault)
+      {
+        // one last chance
+        doublefault = 0;
+
+        sendstring("Likely a doublefault\n");
+
+        if ((isContributoryInterrupt(idtvectorinfo.interruptvector)) &&
+            (isContributoryInterrupt(intinfo.interruptvector)))
+        {
+          // both are contributory exceptions
+          sendstring("BOTH are contributory\n");
+          doublefault = 1; // too bad
+        }
+
+        if (idtvectorinfo.interruptvector == 14)
+        {
+          // idt indicated a pagefault
+          sendstring("idtvector=14\n");
+
+          if (isContributoryInterrupt(intinfo.interruptvector))
+          {
+            sendstring("is contributory\n");
+            doublefault = 1;
+          }
+
+          if (intinfo.interruptvector == 14)
+          {
+            sendstring("intvector=14\n");
+            doublefault = 1;
+          }
+        }
+      }
+    }
+    else
     {
-      // one last chance
-      doublefault = 0;
-
-      sendstring("Likely a doublefault\n");
-
-      if ((isContributoryInterrupt(idtvectorinfo.interruptvector)) &&
-          (isContributoryInterrupt(intinfo.interruptvector)))
-      {
-        // both are contributory exceptions
-        sendstring("BOTH are contributory\n");
-        doublefault = 1; // too bad
-      }
-
-      if (idtvectorinfo.interruptvector == 14)
-      {
-        // idt indicated a pagefault
-        sendstring("idtvector=14\n");
-
-        if (isContributoryInterrupt(intinfo.interruptvector))
-        {
-          sendstring("is contributory\n");
-          doublefault = 1;
-        }
-
-        if (intinfo.interruptvector == 14)
-        {
-          sendstring("intvector=14\n");
-          doublefault = 1;
-        }
-      }
+      // else not a hardware exception to no doublefault
     }
+  }
+
+  // normal handling
+
+  VMEntry_interruption_information newintinfo;
+  newintinfo.interruption_information = 0;
+  // send event to guest
+
+  if (doublefault)
+  {
+    // int originalnosendchar=nosendchar[getAPICID()];
+
+    nosendchar[getAPICID()] = 0;
+
+    // pass the doublefault int to the guest
+    newintinfo.interruptvector = 8; // DF
+    newintinfo.type = 3;            // hardware
+    newintinfo.haserrorcode = 1;    // errorcode
+    newintinfo.valid = 1;
+    vmwrite(vm_entry_exceptionerrorcode, 0); // entry errorcode
+
+    sendstring("DOUBLEFAULT RAISED\n\r");
   }
   else
   {
-    // else not a hardware exception to no doublefault
+    // pass the original int to the guest
+    sendstring("Passing original interrupt to guest\n");
+    newintinfo.interruptvector = intinfo.interruptvector;
+    newintinfo.type = intinfo.type;
+    newintinfo.haserrorcode = intinfo.haserrorcode;
+    newintinfo.valid = intinfo.valid;                                        // should be 1...
+    vmwrite(vm_entry_exceptionerrorcode, vmread(vm_exit_interruptionerror)); // entry errorcode
+
+    if (newintinfo.type == 0)
+      return 0;
   }
-}
 
-// normal handling
+  // nosendchar[getAPICID()]=0;
+  sendstringf("CS:EIP=0x%x:0x%x", vmread(vm_guest_cs), vmread(vm_guest_rip));
 
-VMEntry_interruption_information newintinfo;
-newintinfo.interruption_information = 0;
-// send event to guest
+  sendstringf("newintinfo.interruptvector=%d\n\r", newintinfo.interruptvector);
+  sendstringf("newintinfo.type=%d\n\r", newintinfo.type);
+  sendstringf("newintinfo.haserrorcode=%d\n\r", newintinfo.haserrorcode);
+  if (newintinfo.haserrorcode)
+  {
+    sendstringf("newintinfo.errorcode=%x\n\r", vmread(0x4018));
+  }
 
-if (doublefault)
-{
-  // int originalnosendchar=nosendchar[getAPICID()];
+  sendstringf("newintinfo.valid=%d\n\r", newintinfo.valid);
 
-  nosendchar[getAPICID()] = 0;
+  if (newintinfo.type != 5)
+  {
+    vmwrite(vm_entry_interruptioninfo, newintinfo.interruption_information); // entry info field
+    vmwrite(0x401a, vmread(vm_exit_instructionlength));                      // entry instruction length
+  }
+  else
+  {
+    // int1
+    vmwrite(vm_pending_debug_exceptions, vmread(vm_pending_debug_exceptions) | (1 << 14));
+    vmwrite(vm_guest_rip, vmread(vm_guest_rip) + vmread(vm_exit_instructionlength));
+  }
 
-  // pass the doublefault int to the guest
-  newintinfo.interruptvector = 8; // DF
-  newintinfo.type = 3;            // hardware
-  newintinfo.haserrorcode = 1;    // errorcode
-  newintinfo.valid = 1;
-  vmwrite(vm_entry_exceptionerrorcode, 0); // entry errorcode
+  if (isFault)
+  {
+    // set RF flag
+    UINT64 rflags = vmread(vm_guest_rflags);
+    PRFLAGS prflags = (PRFLAGS)&rflags;
+    prflags->RF = 1;
+    vmwrite(vm_guest_rflags, rflags);
+  }
 
-  sendstring("DOUBLEFAULT RAISED\n\r");
-}
-else
-{
-  // pass the original int to the guest
-  sendstring("Passing original interrupt to guest\n");
-  newintinfo.interruptvector = intinfo.interruptvector;
-  newintinfo.type = intinfo.type;
-  newintinfo.haserrorcode = intinfo.haserrorcode;
-  newintinfo.valid = intinfo.valid;                                        // should be 1...
-  vmwrite(vm_entry_exceptionerrorcode, vmread(vm_exit_interruptionerror)); // entry errorcode
-
-  if (newintinfo.type == 0)
-    return 0;
-}
-
-// nosendchar[getAPICID()]=0;
-sendstringf("CS:EIP=0x%x:0x%x", vmread(vm_guest_cs), vmread(vm_guest_rip));
-
-sendstringf("newintinfo.interruptvector=%d\n\r", newintinfo.interruptvector);
-sendstringf("newintinfo.type=%d\n\r", newintinfo.type);
-sendstringf("newintinfo.haserrorcode=%d\n\r", newintinfo.haserrorcode);
-if (newintinfo.haserrorcode)
-{
-  sendstringf("newintinfo.errorcode=%x\n\r", vmread(0x4018));
-}
-
-sendstringf("newintinfo.valid=%d\n\r", newintinfo.valid);
-
-if (newintinfo.type != 5)
-{
-  vmwrite(vm_entry_interruptioninfo, newintinfo.interruption_information); // entry info field
-  vmwrite(0x401a, vmread(vm_exit_instructionlength));                      // entry instruction length
-}
-else
-{
-  // int1
-  vmwrite(vm_pending_debug_exceptions, vmread(vm_pending_debug_exceptions) | (1 << 14));
-  vmwrite(vm_guest_rip, vmread(vm_guest_rip) + vmread(vm_exit_instructionlength));
-}
-
-if (isFault)
-{
-  // set RF flag
-  UINT64 rflags = vmread(vm_guest_rflags);
-  PRFLAGS prflags = (PRFLAGS)&rflags;
-  prflags->RF = 1;
-  vmwrite(vm_guest_rflags, rflags);
-}
-
-sendstringf("Protected mode interrupt handled\n\r");
-return 0;
+  sendstringf("Protected mode interrupt handled\n\r");
+  return 0;
 }
 
 BOOL handleHardwareBreakpoint(pcpuinfo currentcpuinfo, VMRegisters *vmregisters, FXSAVE64 *fxsave)
