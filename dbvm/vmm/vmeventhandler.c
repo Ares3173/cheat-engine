@@ -1810,7 +1810,7 @@ static inline void host_cpuid(uint32_t leaf, uint32_t subleaf,
 static inline uint8_t get_cpl()
 {
     // CPL = low 2 bits of CS selector
-    uint16_t cs = static_cast<uint16_t>(vmread(vm_guest_cs_selector));
+    uint16_t cs = static_cast<uint16_t>(vmread(vm_guest_cs));
     return static_cast<uint8_t>(cs & 0x3);
 }
 
