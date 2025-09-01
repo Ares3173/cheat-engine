@@ -1819,12 +1819,11 @@ static inline BYTE get_cpl(void)
     return (BYTE)(cs & 0x3);
 }
 
-static inline void fill_vendor_AuthenticAMD(UINT32 &ebx, UINT32 &ecx, UINT32 &edx)
+static inline void fill_vendor_AuthenticAMD(UINT32 *ebx, UINT32 *ecx, UINT32 *edx)
 {
-    // "AuthenticAMD" -> EBX="Auth", EDX="enti", ECX="cAMD"
-    ebx = 0x68747541u; // 'Auth'
-    edx = 0x69746e65u; // 'enti'
-    ecx = 0x444d4163u; // 'cAMD'
+    *ebx = 0x68747541u; /* "Auth" */
+    *edx = 0x69746e65u; /* "enti" */
+    *ecx = 0x444d4163u; /* "cAMD" */
 }
 
 static inline void fill_brand_AMD(const char* brand16,
@@ -1863,79 +1862,100 @@ static inline void brand_block_48chars(const char* full48,
     memcpy(c2, buf + 40, 4); memcpy(d2, buf + 44, 4);
 }
 
-static void apply_amd_user_policy(UINT32 leaf, UINT32 subleaf,
-                                  UINT32 &a, UINT32 &b, UINT32 &c, UINT32 &d,
-                                  UINT64 guest_cr4 /*optional for OSXSAVE reflect*/)
+static void apply_amd_stealth_policy(UINT32 leaf, UINT32 subleaf,
+                                     UINT32 *a, UINT32 *b, UINT32 *c, UINT32 *d,
+                                     UINT64 guest_cr4)
 {
     switch (leaf)
     {
     case 0x00000000: {
-        // Basic vendor: spoof vendor + keep a reasonable max basic leaf (don’t overshare)
-        UINT32 host_max, hb, hc, hd;
-        host_cpuid(0, 0, host_max, hb, hc, hd);
-        a = (host_max >= 0x00000016) ? 0x00000016 : host_max; // cap conservatively
+        /* Keep host max basic leaf; spoof vendor string */
+        UINT32 ha,hb,hc,hd; host_cpuid_ex(0,0, &ha,&hb,&hc,&hd);
+        *a = ha;
         fill_vendor_AuthenticAMD(b, c, d);
         break;
     }
     case 0x00000001: {
-        // Start from host, sanitize:
-        // - Clear hypervisor present bit ECX[31]
-        // - Clear VMX ECX[5] to avoid Intel-only feature while pretending AMD
-        UINT32 ha,hb,hc,hd; host_cpuid(1,0,ha,hb,hc,hd);
-        a = ha; b = hb; c = hc; d = hd;
-        c &= ~(1u<<31); // hide HV
-        c &= ~(1u<<5 ); // hide VMX
-        // Reflect OSXSAVE activation if guest enabled it in CR4 (optional but nice)
-        if (guest_cr4 & CR4_OSXSAVE) c |= (1u<<27);
-        else                         c &= ~(1u<<27);
+        UINT32 ha,hb,hc,hd; host_cpuid_ex(1,0, &ha,&hb,&hc,&hd);
+        *a = ha; *b = hb; *c = hc; *d = hd;
+
+        /* Hide hypervisor present bit */
+        *c &= ~(1u << 31);
+
+        /* Pretend AMD: clear VMX */
+        *c &= ~(1u << 5);
+
+        /* Reflect OSXSAVE activation if you want to keep consistency */
+        if (guest_cr4 & CR4_OSXSAVE) *c |=  (1u << 27);
+        else                         *c &= ~(1u << 27);
         break;
     }
     case 0x00000007: {
-        // Feature leaf 7: pass-through but keep it plausible. (Optionally sanitize SGX etc.)
-        UINT32 s0a,s0b,s0c,s0d; host_cpuid(7, subleaf, s0a,s0b,s0c,s0d);
-        a = s0a; b = s0b; c = s0c; d = s0d;
+        UINT32 s_a, s_b, s_c, s_d; host_cpuid_ex(7, subleaf, &s_a,&s_b,&s_c,&s_d);
+        *a = s_a; *b = s_b; *c = s_c; *d = s_d;
+
+        /* Intel-only giveaways when posing as AMD */
+        *b &= ~(1u << 2);   /* SGX */
+        *b &= ~(1u << 4);   /* HLE */
+        *b &= ~(1u << 11);  /* RTM */
         break;
     }
-    case 0x40000000: // Hypervisor leaves: pretend absent
+
+    /* Hypervisor leaves: always blank */
+    case 0x40000000:
     case 0x40000001:
     case 0x40000002:
     case 0x40000003:
     case 0x40000004:
-        a = b = c = d = 0; 
+    case 0x40000005:
+    case 0x40000006:
+    case 0x40000007:
+    case 0x40000008:
+    case 0x40000009:
+    case 0x4000000A:
+    case 0x4000000B:
+    case 0x4000000C:
+    case 0x4000000D:
+    case 0x4000000E:
+    case 0x4000000F:
+        *a = *b = *c = *d = 0;
         break;
 
     case 0x80000000: {
-        // Extended max; advertise a sane AMD set up to 0x80000008
-        a = 0x80000008; b = c = d = 0;
+        /* Say we support up to 0x80000008 (common AMD range). Keep conservative. */
+        *a = 0x80000008u; *b = *c = *d = 0;
         break;
     }
     case 0x80000001: {
-        // Extended features: start from host but clear VMX-ish mismatches and SVM by default
-        UINT32 ha,hb,hc,hd; host_cpuid(0x80000001,0,ha,hb,hc,hd);
-        a = ha; b = hb; c = hc; d = hd;
-        // AMD SVM bit = ECX[2].  For stealth we keep it 0; set it if you *want* to look AMD-V capable.
-        c &= ~(1u<<2);   // <- change to (c |= (1u<<2)) if you WANT SVM visible
-        // (Optional) Clear Intel-ish extended anomalies if present
+        UINT32 ha,hb,hc,hd; host_cpuid_ex(0x80000001, 0, &ha,&hb,&hc,&hd);
+        *a = ha; *b = hb; *c = hc; *d = hd;
+
+        /* Hide AMD-V (SVM) for stealth (ECX[2]) — flip to |= if you want to expose */
+        *c &= ~(1u << 2);
         break;
     }
     case 0x80000002:
     case 0x80000003:
     case 0x80000004: {
-        // 48-byte brand string across these three leaves
-        // Keep it generic to avoid cross-check mismatches:
-        // (exactly 48 chars or padded with spaces)
+        /* Provide a neutral AMD brand string (48 chars, padded with spaces). */
         static const char BRAND48[] =
-            "AMD Ryzen Processor                      "; // 48 chars total (pad with spaces)
+            "AMD Ryzen Processor                      "; /* 48 chars total */
         UINT32 a0,b0,c0,d0,a1,b1,c1,d1,a2,b2,c2,d2;
-        brand_block_48chars(BRAND48, a0,b0,c0,d0, a1,b1,c1,d1, a2,b2,c2,d2);
-        if (leaf == 0x80000002) { a=a0; b=b0; c=c0; d=d0; }
-        if (leaf == 0x80000003) { a=a1; b=b1; c=c1; d=d1; }
-        if (leaf == 0x80000004) { a=a2; b=b2; c=c2; d=d2; }
+        brand_block_48chars(BRAND48, &a0,&b0,&c0,&d0, &a1,&b1,&c1,&d1, &a2,&b2,&c2,&d2);
+
+        if (leaf == 0x80000002) { *a=a0; *b=b0; *c=c0; *d=d0; }
+        if (leaf == 0x80000003) { *a=a1; *b=b1; *c=c1; *d=d1; }
+        if (leaf == 0x80000004) { *a=a2; *b=b2; *c=c2; *d=d2; }
         break;
     }
+
     default: {
-        // Pass-through by default; sanitize hypervisor bit if leaf==1 (handled above)
-        host_cpuid(leaf, subleaf, a,b,c,d);
+        /* Pass-through by default (stability), but hide HV bit if someone re-checks leaf 1 */
+        host_cpuid_ex(leaf, subleaf, a, b, c, d);
+        if (leaf == 1) {
+            *c &= ~(1u << 31);
+            *c &= ~(1u << 5); /* VMX off when posing AMD */
+        }
         break;
     }
     }
@@ -1943,30 +1963,30 @@ static void apply_amd_user_policy(UINT32 leaf, UINT32 subleaf,
 
 int handleCPUID(VMRegisters *vmregisters)
 {
-    // Single-step inject if needed
+    /* Inject #DB single-step if TF=1 (unchanged behavior) */
     RFLAGS flags; flags.value = vmread(vm_guest_rflags);
-    if (flags.TF) vmwrite(vm_pending_debug_exceptions, 0x4000);
+    if (flags.TF)
+        vmwrite(vm_pending_debug_exceptions, 0x4000);
 
-    const UINT32 leaf    = static_cast<UINT32>(vm->rax);
-    const UINT32 subleaf = static_cast<UINT32>(vm->rcx);
+    /* Guest request */
+    UINT32 leaf    = (UINT32)vmregisters->rax;
+    UINT32 subleaf = (UINT32)vmregisters->rcx;
 
-    // Baseline from host (we'll override as needed)
+    /* Baseline host result */
     UINT32 a=0,b=0,c=0,d=0;
-    host_cpuid(leaf, subleaf, a,b,c,d);
+    host_cpuid_ex(leaf, subleaf, &a, &b, &c, &d);
 
-    // Optional: read guest CR4 to reflect OSXSAVE correctly (uncomment if you track guest CR4)
-    UINT64 guest_cr4 = /* vmread(vm_guest_cr4) */ 0;
+    /* Optional: reflect OSXSAVE based on guest CR4 */
+    UINT64 guest_cr4 = vmread(vm_guest_cr4);
 
-    // Only spoof for CPL=3 (user-mode). Kernel stays close to host to avoid instability.
-    if (get_cpl() == 3) {
-        apply_amd_user_policy(leaf, subleaf, a,b,c,d, guest_cr4);
-    } else {
-        // Minimal kernel sanitization: optionally hide HV bit in leaf 1
-        if (leaf == 1) c &= ~(1u<<31);
-    }
+    /* Apply stealth AMD persona (hide HV for all CPLs per your request) */
+    apply_amd_stealth_policy(leaf, subleaf, &a, &b, &c, &d, guest_cr4);
 
-    vm->rax = a; vm->rbx = b; vm->rcx = c; vm->rdx = d;
-
+    /* Write back to guest regs */
+    vmregisters->rax = (UINT64)a;
+    vmregisters->rbx = (UINT64)b;
+    vmregisters->rcx = (UINT64)c;
+    vmregisters->rdx = (UINT64)d;
   incrementRIP(vmread(vm_exit_instructionlength));
 
   getcpuinfo()->lastTSCTouch = _rdtsc();
