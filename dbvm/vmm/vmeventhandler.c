@@ -1796,25 +1796,30 @@ int handleRDMSR(pcpuinfo currentcpuinfo, VMRegisters *vmregisters)
 
 criticalSection cpuidsourcesCS = {.name = "cpuidsourcesCS", .debuglevel = 2};
 
-static inline void host_cpuid(uint32_t leaf, uint32_t subleaf,
-                              uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d)
+static inline void host_cpuid_ex(UINT32 leaf, UINT32 subleaf,
+                                 UINT32 *a, UINT32 *b, UINT32 *c, UINT32 *d)
 {
-    int regs[4] = {0,0,0,0};
-    __cpuidex(regs, static_cast<int>(leaf), static_cast<int>(subleaf));
-    a = static_cast<uint32_t>(regs[0]);
-    b = static_cast<uint32_t>(regs[1]);
-    c = static_cast<uint32_t>(regs[2]);
-    d = static_cast<uint32_t>(regs[3]);
+    UINT64 ra = (UINT64)leaf;
+    UINT64 rb = 0;
+    UINT64 rc = (UINT64)subleaf;
+    UINT64 rd = 0;
+
+    _cpuid(&ra, &rb, &rc, &rd);   /* executes CPUID with EAX=leaf, ECX=subleaf */
+
+    *a = (UINT32)ra;
+    *b = (UINT32)rb;
+    *c = (UINT32)rc;
+    *d = (UINT32)rd;
 }
 
-static inline uint8_t get_cpl()
+static inline BYTE get_cpl(void)
 {
-    // CPL = low 2 bits of CS selector
-    uint16_t cs = static_cast<uint16_t>(vmread(vm_guest_cs));
-    return static_cast<uint8_t>(cs & 0x3);
+    /* CPL = RPL = low 2 bits of the guest CS selector */
+    WORD cs = (WORD)vmread(vm_guest_cs_selector); /* or vm_guest_cs in your headers */
+    return (BYTE)(cs & 0x3);
 }
 
-static inline void fill_vendor_AuthenticAMD(uint32_t &ebx, uint32_t &ecx, uint32_t &edx)
+static inline void fill_vendor_AuthenticAMD(UINT32 &ebx, UINT32 &ecx, UINT32 &edx)
 {
     // "AuthenticAMD" -> EBX="Auth", EDX="enti", ECX="cAMD"
     ebx = 0x68747541u; // 'Auth'
@@ -1822,42 +1827,51 @@ static inline void fill_vendor_AuthenticAMD(uint32_t &ebx, uint32_t &ecx, uint32
     ecx = 0x444d4163u; // 'cAMD'
 }
 
-static inline void fill_brand_AMD(const char* brand48, uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d)
+static inline void fill_brand_AMD(const char* brand16,
+                                  UINT32 *a, UINT32 *b, UINT32 *c, UINT32 *d)
 {
-    // brand48 must be <= 48 chars, padded with spaces
-    char tmp[16] = {};
-    std::memset(tmp, ' ', sizeof(tmp));
-    std::memcpy(tmp, brand48, std::min<size_t>(std::strlen(brand48), sizeof(tmp)));
-    std::memcpy(&a, tmp + 0, 4);
-    std::memcpy(&b, tmp + 4, 4);
-    std::memcpy(&c, tmp + 8, 4);
-    std::memcpy(&d, tmp + 12,4);
+    char tmp[16];
+    size_t n = strlen(brand16);
+    if (n > sizeof(tmp)) n = sizeof(tmp);
+
+    memset(tmp, ' ', sizeof(tmp));
+    memcpy(tmp, brand16, n);
+
+    memcpy(a, tmp + 0, 4);
+    memcpy(b, tmp + 4, 4);
+    memcpy(c, tmp + 8, 4);
+    memcpy(d, tmp + 12, 4);
 }
 
 static inline void brand_block_48chars(const char* full48,
-                                       uint32_t &a0, uint32_t &b0, uint32_t &c0, uint32_t &d0,
-                                       uint32_t &a1, uint32_t &b1, uint32_t &c1, uint32_t &d1,
-                                       uint32_t &a2, uint32_t &b2, uint32_t &c2, uint32_t &d2)
+                                       UINT32 *a0, UINT32 *b0, UINT32 *c0, UINT32 *d0,
+                                       UINT32 *a1, UINT32 *b1, UINT32 *c1, UINT32 *d1,
+                                       UINT32 *a2, UINT32 *b2, UINT32 *c2, UINT32 *d2)
 {
-    char buf[48]; std::memset(buf, ' ', sizeof(buf));
-    std::memcpy(buf, full48, std::min<size_t>(std::strlen(full48), sizeof(buf)));
-    std::memcpy(&a0, buf +  0, 4); std::memcpy(&b0, buf +  4, 4);
-    std::memcpy(&c0, buf +  8, 4); std::memcpy(&d0, buf + 12, 4);
-    std::memcpy(&a1, buf + 16, 4); std::memcpy(&b1, buf + 20, 4);
-    std::memcpy(&c1, buf + 24, 4); std::memcpy(&d1, buf + 28, 4);
-    std::memcpy(&a2, buf + 32, 4); std::memcpy(&b2, buf + 36, 4);
-    std::memcpy(&c2, buf + 40, 4); std::memcpy(&d2, buf + 44, 4);
+    char buf[48];
+    size_t n = strlen(full48);
+    if (n > sizeof(buf)) n = sizeof(buf);
+
+    memset(buf, ' ', sizeof(buf));
+    memcpy(buf, full48, n);
+
+    memcpy(a0, buf +  0, 4); memcpy(b0, buf +  4, 4);
+    memcpy(c0, buf +  8, 4); memcpy(d0, buf + 12, 4);
+    memcpy(a1, buf + 16, 4); memcpy(b1, buf + 20, 4);
+    memcpy(c1, buf + 24, 4); memcpy(d1, buf + 28, 4);
+    memcpy(a2, buf + 32, 4); memcpy(b2, buf + 36, 4);
+    memcpy(c2, buf + 40, 4); memcpy(d2, buf + 44, 4);
 }
 
-static void apply_amd_user_policy(uint32_t leaf, uint32_t subleaf,
-                                  uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d,
-                                  uint64_t guest_cr4 /*optional for OSXSAVE reflect*/)
+static void apply_amd_user_policy(UINT32 leaf, UINT32 subleaf,
+                                  UINT32 &a, UINT32 &b, UINT32 &c, UINT32 &d,
+                                  UINT64 guest_cr4 /*optional for OSXSAVE reflect*/)
 {
     switch (leaf)
     {
     case 0x00000000: {
         // Basic vendor: spoof vendor + keep a reasonable max basic leaf (don’t overshare)
-        uint32_t host_max, hb, hc, hd;
+        UINT32 host_max, hb, hc, hd;
         host_cpuid(0, 0, host_max, hb, hc, hd);
         a = (host_max >= 0x00000016) ? 0x00000016 : host_max; // cap conservatively
         fill_vendor_AuthenticAMD(b, c, d);
@@ -1867,7 +1881,7 @@ static void apply_amd_user_policy(uint32_t leaf, uint32_t subleaf,
         // Start from host, sanitize:
         // - Clear hypervisor present bit ECX[31]
         // - Clear VMX ECX[5] to avoid Intel-only feature while pretending AMD
-        uint32_t ha,hb,hc,hd; host_cpuid(1,0,ha,hb,hc,hd);
+        UINT32 ha,hb,hc,hd; host_cpuid(1,0,ha,hb,hc,hd);
         a = ha; b = hb; c = hc; d = hd;
         c &= ~(1u<<31); // hide HV
         c &= ~(1u<<5 ); // hide VMX
@@ -1878,7 +1892,7 @@ static void apply_amd_user_policy(uint32_t leaf, uint32_t subleaf,
     }
     case 0x00000007: {
         // Feature leaf 7: pass-through but keep it plausible. (Optionally sanitize SGX etc.)
-        uint32_t s0a,s0b,s0c,s0d; host_cpuid(7, subleaf, s0a,s0b,s0c,s0d);
+        UINT32 s0a,s0b,s0c,s0d; host_cpuid(7, subleaf, s0a,s0b,s0c,s0d);
         a = s0a; b = s0b; c = s0c; d = s0d;
         break;
     }
@@ -1897,7 +1911,7 @@ static void apply_amd_user_policy(uint32_t leaf, uint32_t subleaf,
     }
     case 0x80000001: {
         // Extended features: start from host but clear VMX-ish mismatches and SVM by default
-        uint32_t ha,hb,hc,hd; host_cpuid(0x80000001,0,ha,hb,hc,hd);
+        UINT32 ha,hb,hc,hd; host_cpuid(0x80000001,0,ha,hb,hc,hd);
         a = ha; b = hb; c = hc; d = hd;
         // AMD SVM bit = ECX[2].  For stealth we keep it 0; set it if you *want* to look AMD-V capable.
         c &= ~(1u<<2);   // <- change to (c |= (1u<<2)) if you WANT SVM visible
@@ -1912,7 +1926,7 @@ static void apply_amd_user_policy(uint32_t leaf, uint32_t subleaf,
         // (exactly 48 chars or padded with spaces)
         static const char BRAND48[] =
             "AMD Ryzen Processor                      "; // 48 chars total (pad with spaces)
-        uint32_t a0,b0,c0,d0,a1,b1,c1,d1,a2,b2,c2,d2;
+        UINT32 a0,b0,c0,d0,a1,b1,c1,d1,a2,b2,c2,d2;
         brand_block_48chars(BRAND48, a0,b0,c0,d0, a1,b1,c1,d1, a2,b2,c2,d2);
         if (leaf == 0x80000002) { a=a0; b=b0; c=c0; d=d0; }
         if (leaf == 0x80000003) { a=a1; b=b1; c=c1; d=d1; }
@@ -1933,15 +1947,15 @@ int handleCPUID(VMRegisters *vmregisters)
     RFLAGS flags; flags.value = vmread(vm_guest_rflags);
     if (flags.TF) vmwrite(vm_pending_debug_exceptions, 0x4000);
 
-    const uint32_t leaf    = static_cast<uint32_t>(vm->rax);
-    const uint32_t subleaf = static_cast<uint32_t>(vm->rcx);
+    const UINT32 leaf    = static_cast<UINT32>(vm->rax);
+    const UINT32 subleaf = static_cast<UINT32>(vm->rcx);
 
     // Baseline from host (we'll override as needed)
-    uint32_t a=0,b=0,c=0,d=0;
+    UINT32 a=0,b=0,c=0,d=0;
     host_cpuid(leaf, subleaf, a,b,c,d);
 
     // Optional: read guest CR4 to reflect OSXSAVE correctly (uncomment if you track guest CR4)
-    uint64_t guest_cr4 = /* vmread(vm_guest_cr4) */ 0;
+    UINT64 guest_cr4 = /* vmread(vm_guest_cr4) */ 0;
 
     // Only spoof for CPL=3 (user-mode). Kernel stays close to host to avoid instability.
     if (get_cpl() == 3) {
