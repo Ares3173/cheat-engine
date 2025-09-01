@@ -1785,7 +1785,7 @@ int emulateRMinterrupt(pcpuinfo currentcpuinfo, VMRegisters *vmregisters UNUSED,
   pguestrflags->IF=0;
   pguestrflags->TF=0;
   pguestrflags->AC=0;
-  pguestrflags->RF=0;
+  //pguestrflags->RF=0;
   vmwrite(vm_guest_rflags,(ULONG)guestrflags); //rflags
 
 
