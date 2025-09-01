@@ -1815,7 +1815,7 @@ static inline void host_cpuid_ex(UINT32 leaf, UINT32 subleaf,
 static inline BYTE get_cpl(void)
 {
     /* CPL = RPL = low 2 bits of the guest CS selector */
-    WORD cs = (WORD)vmread(vm_guest_cs_selector); /* or vm_guest_cs in your headers */
+    WORD cs = (WORD)vmread(vm_guest_cs); /* or vm_guest_cs in your headers */
     return (BYTE)(cs & 0x3);
 }
 
